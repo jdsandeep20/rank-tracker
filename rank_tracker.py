@@ -21,6 +21,7 @@ LANGUAGE_CODE = "en"
 DISCOVERY_PAGE_SIZE = 1000
 MAX_POSITION = 100
 WORKERS = 8
+MAX_SERP_RETRIES = 5
 TARGET_DOMAIN = os.getenv("TARGET_DOMAIN", "melbournelandscape.com.au").strip().lower()
 OUTPUT_DIR = Path("results")
 
@@ -106,30 +107,45 @@ def check_melbourne_keyword(
     keyword: str, volume: int | str, login: str, password: str
 ) -> dict[str, Any] | None:
     """Run a live Google query from Melbourne and return the site's organic position."""
-    with requests.Session() as session:
-        payload = [{
-            "keyword": keyword,
-            "location_name": MELBOURNE_LOCATION_NAME,
-            "language_code": LANGUAGE_CODE,
-            "device": "desktop",
-            "os": "windows",
-            "depth": MAX_POSITION,
-        }]
-        body = request_json(session, SERP_URL, login, password, payload)
+    payload = [{
+        "keyword": keyword,
+        "location_name": MELBOURNE_LOCATION_NAME,
+        "language_code": LANGUAGE_CODE,
+        "device": "desktop",
+        "os": "windows",
+        "depth": MAX_POSITION,
+    }]
+    last_error: RuntimeError | None = None
+
+    for attempt in range(MAX_SERP_RETRIES):
+        with requests.Session() as session:
+            body = request_json(session, SERP_URL, login, password, payload)
         tasks = body.get("tasks") or []
         if len(tasks) != 1:
             raise RuntimeError(f"Unexpected DataForSEO SERP response for {keyword!r}")
-        result = task_result(tasks[0])
 
-    items = result[0].get("items") if result else []
-    for item in items or []:
-        if item.get("type") == "organic" and is_target_domain(item.get("domain")):
-            return {
-                "keyword": keyword,
-                "ranking_position": item.get("rank_absolute"),
-                "monthly_search_volume": volume,
-            }
-    return None
+        task = tasks[0]
+        if task.get("status_code") == 40101:
+            last_error = RuntimeError(
+                f"DataForSEO temporary server error after {attempt + 1} attempt(s)"
+            )
+            if attempt < MAX_SERP_RETRIES - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise last_error
+
+        result = task_result(task)
+        items = result[0].get("items") if result else []
+        for item in items or []:
+            if item.get("type") == "organic" and is_target_domain(item.get("domain")):
+                return {
+                    "keyword": keyword,
+                    "ranking_position": item.get("rank_absolute"),
+                    "monthly_search_volume": volume,
+                }
+        return None
+
+    raise last_error or RuntimeError("Unexpected SERP retry failure")
 
 
 def fetch_melbourne_rankings(login: str, password: str) -> list[dict[str, Any]]:
@@ -155,9 +171,13 @@ def fetch_melbourne_rankings(login: str, password: str) -> list[dict[str, Any]]:
                 failures.append(f"{keyword}: {error}")
 
     if failures:
-        raise RuntimeError(
-            f"{len(failures)} Melbourne checks failed. First error: {failures[0]}"
+        print(
+            f"WARNING: skipped {len(failures)} temporary/failed keyword check(s). "
+            f"First: {failures[0]}",
+            file=sys.stderr,
         )
+    if candidates and len(failures) == len(candidates):
+        raise RuntimeError("Every Melbourne keyword check failed; no CSV was saved.")
 
     return sorted(rows, key=lambda row: (int(row["ranking_position"]), row["keyword"].lower()))
 
