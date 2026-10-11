@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
-"""Export Google Melbourne organic rankings for one domain via DataForSEO Labs."""
+"""Export actual Google Melbourne organic rankings for one domain via DataForSEO."""
 
 from __future__ import annotations
 
 import csv
 import os
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 import requests
 
-API_URL = "https://api.dataforseo.com/v3/dataforseo_labs/google/ranked_keywords/live"
-LOCATION_NAME = os.getenv("LOCATION_NAME", "Melbourne,Victoria,Australia").strip()
+LABS_URL = "https://api.dataforseo.com/v3/dataforseo_labs/google/ranked_keywords/live"
+SERP_URL = "https://api.dataforseo.com/v3/serp/google/organic/live/advanced"
+AUSTRALIA_LOCATION_CODE = 2036
+MELBOURNE_LOCATION_NAME = "Melbourne,Victoria,Australia"
 LANGUAGE_CODE = "en"
-PAGE_SIZE = 1000
+DISCOVERY_PAGE_SIZE = 1000
 MAX_POSITION = 100
+WORKERS = 8
 TARGET_DOMAIN = os.getenv("TARGET_DOMAIN", "melbournelandscape.com.au").strip().lower()
 OUTPUT_DIR = Path("results")
 
@@ -27,36 +32,40 @@ def require_env(name: str) -> str:
     return value
 
 
-def unwrap(task: dict[str, Any]) -> list[dict[str, Any]]:
+def task_result(task: dict[str, Any]) -> list[dict[str, Any]]:
     if task.get("status_code") != 20000:
         raise RuntimeError(
             f"DataForSEO task failed ({task.get('status_code')}): {task.get('status_message')}"
         )
-    result = task.get("result") or []
-    if not result:
-        return []
-    return result[0].get("items") or []
+    return task.get("result") or []
 
 
-def get_value(data: dict[str, Any], *path: str) -> Any:
-    value: Any = data
-    for key in path:
-        if not isinstance(value, dict):
-            return None
-        value = value.get(key)
-    return value
+def request_json(
+    session: requests.Session, url: str, login: str, password: str, payload: list[dict[str, Any]]
+) -> dict[str, Any]:
+    for attempt in range(3):
+        response = session.post(url, auth=(login, password), json=payload, timeout=90)
+        if response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+            time.sleep(2 ** attempt)
+            continue
+        response.raise_for_status()
+        return response.json()
+    raise RuntimeError("DataForSEO request failed after retries")
 
 
-def fetch_rankings(login: str, password: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+def discover_keywords(
+    session: requests.Session, login: str, password: str
+) -> dict[str, int | str]:
+    """Find the site's existing Australian ranking keywords and their AU volumes."""
+    keywords: dict[str, int | str] = {}
     offset = 0
 
     while True:
         payload = [{
             "target": TARGET_DOMAIN,
-            "location_name": LOCATION_NAME,
+            "location_code": AUSTRALIA_LOCATION_CODE,
             "language_code": LANGUAGE_CODE,
-            "limit": PAGE_SIZE,
+            "limit": DISCOVERY_PAGE_SIZE,
             "offset": offset,
             "include_serp_info": False,
             "filters": [[
@@ -65,38 +74,90 @@ def fetch_rankings(login: str, password: str) -> list[dict[str, Any]]:
                 MAX_POSITION,
             ]],
         }]
-
-        response = requests.post(
-            API_URL,
-            auth=(login, password),
-            json=payload,
-            timeout=90,
-        )
-        response.raise_for_status()
-        body = response.json()
+        body = request_json(session, LABS_URL, login, password, payload)
         tasks = body.get("tasks") or []
         if len(tasks) != 1:
-            raise RuntimeError(f"Unexpected DataForSEO response: {body}")
-        items = unwrap(tasks[0])
+            raise RuntimeError(f"Unexpected DataForSEO Labs response: {body}")
+        result = task_result(tasks[0])
+        items = result[0].get("items") if result else []
 
-        for item in items:
+        for item in items or []:
             keyword_data = item.get("keyword_data") or {}
             keyword_info = keyword_data.get("keyword_info") or {}
-            serp_item = get_value(item, "ranked_serp_element", "serp_item") or {}
             keyword = keyword_data.get("keyword")
-            position = serp_item.get("rank_group")
-            volume = keyword_info.get("search_volume")
+            if keyword:
+                keywords[keyword] = keyword_info.get("search_volume") or ""
 
-            if keyword and position is not None:
-                rows.append({
-                    "keyword": keyword,
-                    "ranking_position": position,
-                    "monthly_search_volume": volume if volume is not None else "",
-                })
-
-        if len(items) < PAGE_SIZE:
+        if len(items or []) < DISCOVERY_PAGE_SIZE:
             break
-        offset += PAGE_SIZE
+        offset += DISCOVERY_PAGE_SIZE
+
+    return keywords
+
+
+def is_target_domain(domain: str | None) -> bool:
+    if not domain:
+        return False
+    domain = domain.lower().rstrip(".")
+    return domain == TARGET_DOMAIN or domain.endswith(f".{TARGET_DOMAIN}")
+
+
+def check_melbourne_keyword(
+    keyword: str, volume: int | str, login: str, password: str
+) -> dict[str, Any] | None:
+    """Run a live Google query from Melbourne and return the site's organic position."""
+    with requests.Session() as session:
+        payload = [{
+            "keyword": keyword,
+            "location_name": MELBOURNE_LOCATION_NAME,
+            "language_code": LANGUAGE_CODE,
+            "device": "desktop",
+            "os": "windows",
+            "depth": MAX_POSITION,
+        }]
+        body = request_json(session, SERP_URL, login, password, payload)
+        tasks = body.get("tasks") or []
+        if len(tasks) != 1:
+            raise RuntimeError(f"Unexpected DataForSEO SERP response for {keyword!r}")
+        result = task_result(tasks[0])
+
+    items = result[0].get("items") if result else []
+    for item in items or []:
+        if item.get("type") == "organic" and is_target_domain(item.get("domain")):
+            return {
+                "keyword": keyword,
+                "ranking_position": item.get("rank_absolute"),
+                "monthly_search_volume": volume,
+            }
+    return None
+
+
+def fetch_melbourne_rankings(login: str, password: str) -> list[dict[str, Any]]:
+    with requests.Session() as session:
+        candidates = discover_keywords(session, login, password)
+
+    print(f"Checking {len(candidates)} discovered keywords in Melbourne...")
+    rows: list[dict[str, Any]] = []
+    failures: list[str] = []
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+        futures = {
+            executor.submit(check_melbourne_keyword, keyword, volume, login, password): keyword
+            for keyword, volume in candidates.items()
+        }
+        for future in as_completed(futures):
+            keyword = futures[future]
+            try:
+                row = future.result()
+                if row:
+                    rows.append(row)
+            except Exception as error:
+                failures.append(f"{keyword}: {error}")
+
+    if failures:
+        raise RuntimeError(
+            f"{len(failures)} Melbourne checks failed. First error: {failures[0]}"
+        )
 
     return sorted(rows, key=lambda row: (int(row["ranking_position"]), row["keyword"].lower()))
 
@@ -117,7 +178,7 @@ def write_csv(rows: list[dict[str, Any]]) -> Path:
 def main() -> None:
     login = require_env("DFS_LOGIN")
     password = require_env("DFS_PASSWORD")
-    rows = fetch_rankings(login, password)
+    rows = fetch_melbourne_rankings(login, password)
     created = write_csv(rows)
     print(f"Saved {len(rows)} Melbourne rankings to {created}")
 
