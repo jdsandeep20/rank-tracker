@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""Export Google Australia organic rankings for one domain via DataForSEO Labs."""
+"""Export Google Melbourne organic rankings for one domain via DataForSEO Labs."""
 
 from __future__ import annotations
 
 import csv
 import os
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
 
 API_URL = "https://api.dataforseo.com/v3/dataforseo_labs/google/ranked_keywords/live"
-LOCATION_CODE = 2036  # Australia
+LOCATION_NAME = os.getenv("LOCATION_NAME", "Melbourne,Victoria,Australia").strip()
 LANGUAGE_CODE = "en"
 PAGE_SIZE = 1000
 MAX_POSITION = 100
@@ -55,7 +54,7 @@ def fetch_rankings(login: str, password: str) -> list[dict[str, Any]]:
     while True:
         payload = [{
             "target": TARGET_DOMAIN,
-            "location_code": LOCATION_CODE,
+            "location_name": LOCATION_NAME,
             "language_code": LANGUAGE_CODE,
             "limit": PAGE_SIZE,
             "offset": offset,
@@ -104,18 +103,15 @@ def fetch_rankings(login: str, password: str) -> list[dict[str, Any]]:
 
 def write_csv(rows: list[dict[str, Any]]) -> Path:
     OUTPUT_DIR.mkdir(exist_ok=True)
-    now = datetime.now(timezone.utc)
-    latest = OUTPUT_DIR / "latest_rankings.csv"
-    dated = OUTPUT_DIR / f"rankings_{now:%Y-%m-%d}.csv"
+    path = OUTPUT_DIR / "melbourne_rankings.csv"
     columns = ["keyword", "ranking_position", "monthly_search_volume"]
 
-    for path in (latest, dated):
-        with path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=columns)
-            writer.writeheader()
-            writer.writerows(rows)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
 
-    return dated
+    return path
 
 
 def main() -> None:
@@ -123,7 +119,7 @@ def main() -> None:
     password = require_env("DFS_PASSWORD")
     rows = fetch_rankings(login, password)
     created = write_csv(rows)
-    print(f"Saved {len(rows)} rankings to {created}")
+    print(f"Saved {len(rows)} Melbourne rankings to {created}")
 
 
 if __name__ == "__main__":
