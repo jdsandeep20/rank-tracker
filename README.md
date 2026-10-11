@@ -2,13 +2,13 @@
 
 Manual DataForSEO rank tracking for **melbournelandscape.com.au** in Google **Melbourne, Victoria**.
 
-Each run finds all organic keywords ranking in Google's top 100 results when searched from Melbourne and produces exactly these columns:
+The tracker first finds the domain's existing Google Australia keywords, then checks each keyword in a live Google result set located in Melbourne. The CSV contains exactly:
 
 | Column | Meaning |
 | --- | --- |
 | `keyword` | Google search keyword |
 | `ranking_position` | Current organic position in Google Melbourne |
-| `monthly_search_volume` | DataForSEO monthly search volume for Melbourne |
+| `monthly_search_volume` | DataForSEO monthly Australian search volume |
 
 No CPC data is collected. There is no schedule—runs happen only when you start them.
 
@@ -28,6 +28,4 @@ In this repository, open **Settings → Secrets and variables → Actions → Ne
 
 Only one CSV is produced and downloaded per run. The same file is replaced with fresh results each time, and it is also available from the run's **melbourne-rankings** artifact.
 
-## Change the domain or location later
-
-Edit `TARGET_DOMAIN` or `LOCATION_NAME` in `.github/workflows/rank-tracker.yml`.
+Because it performs a live Melbourne Google check for each discovered keyword, a run uses DataForSEO SERP API credits. Results include only keywords where the website is in Google's top 100 Melbourne organic results.
